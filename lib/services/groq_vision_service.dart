@@ -112,10 +112,10 @@ class AiPlateAnalysisResult {
 class GroqVisionService {
   /// Lista de modelos de visión candidatos en Groq (se suman a los descubiertos dinámicamente en /v1/models)
   static const List<String> _fallbackGroqVisionModels = [
+    'Qwen/Qwen3.8-27B',
+    'qwen/qwen3.8-27b',
     'meta-llama/llama-4-maverick-17b-128e-instruct',
     'meta-llama/llama-4-scout-17b-16e-instruct',
-    'llama-3.2-90b-vision-preview',
-    'llama-3.2-11b-vision-preview',
   ];
 
   static const String _systemPrompt = '''
@@ -228,10 +228,11 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
             .where((id) => id.isNotEmpty)
             .toList();
 
-        // Priorizar modelos que contengan palabras clave de visión/multimodal en Groq
+        // Priorizar modelos que contengan palabras clave de visión/multimodal en Groq (incluyendo Qwen 3.8 que acepta archivos de 20 MB)
         for (final id in allIds) {
           final lower = id.toLowerCase();
-          if (lower.contains('vision') ||
+          if (lower.contains('qwen') ||
+              lower.contains('vision') ||
               lower.contains('scout') ||
               lower.contains('maverick') ||
               lower.contains('llama-4') ||
