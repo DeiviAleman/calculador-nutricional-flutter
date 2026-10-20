@@ -46,7 +46,7 @@ class DetectedPlateIngredient {
   }
 }
 
-/// Resultado completo del análisis visual de un plato de comida mediante Groq Vision
+/// Resultado completo del análisis visual de un plato de comida mediante IA
 class AiPlateAnalysisResult {
   final String dishName;
   final String summaryNotes;
@@ -93,9 +93,9 @@ class AiPlateAnalysisResult {
     final count = activeIngredients.length;
 
     return FoodItemMock(
-      qrCodeId: 'IA-GROQ-VISION',
+      qrCodeId: 'IA-VISION',
       name: dishName,
-      brandOrCategory: 'Foto IA Groq • $count ingredientes',
+      brandOrCategory: 'Foto IA • $count ingredientes',
       servingSize: 'Plato (~$totalGrams g)',
       calories: totalCalories,
       proteins: totalProteins,
@@ -108,15 +108,20 @@ class AiPlateAnalysisResult {
   }
 }
 
-/// Servicio para analizar fotografías de platos de comida con Groq Vision API (Fase 5)
+/// Servicio para analizar fotografías de platos de comida con Groq Vision o Gemini Vision (Fase 5)
 class GroqVisionService {
-  static const String defaultVisionModel =
-      'meta-llama/llama-4-scout-17b-16e-instruct';
+  /// Lista de modelos de visión candidatos en Groq (se suman a los descubiertos dinámicamente en /v1/models)
+  static const List<String> _fallbackGroqVisionModels = [
+    'meta-llama/llama-4-maverick-17b-128e-instruct',
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'llama-3.2-90b-vision-preview',
+    'llama-3.2-11b-vision-preview',
+  ];
 
   static const String _systemPrompt = '''
 Eres un nutricionista clínico experto en análisis visual de alimentos.
 Analiza la fotografía del plato de comida proporcionada por el usuario, identifica cada ingrediente visible, estima su peso en gramos en el plato y calcula su información nutricional (calorías en kcal, proteínas en g, grasas en g y carbohidratos en g).
-Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta:
+Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exacta (sin texto adicional fuera del JSON):
 {
   "plato": "Nombre descriptivo del plato",
   "notas": "Breve observación nutricional de 1 línea en español",
@@ -133,7 +138,8 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
 }
 ''';
 
-  /// Envía la imagen en Base64 al endpoint de Groq Chat Completions y devuelve el desglose de ingredientes
+  /// Envía la imagen en Base64 a Groq (descubriendo automáticamente el modelo de visión activo en la cuenta)
+  /// o a Google Gemini si la API Key comienza con "AIza"
   static Future<AiPlateAnalysisResult> analyzePlateImage({
     required Uint8List imageBytes,
     required String apiKey,
@@ -142,21 +148,126 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
     final cleanKey = apiKey.trim();
     if (cleanKey.isEmpty) {
       throw Exception(
-        'Por favor configura tu API Key de Groq (gsk_...) para analizar fotos reales, o usa las muestras de demostración.',
+        'Por favor configura tu API Key (Groq gsk_... o Gemini AIza...) en el botón superior.',
       );
     }
 
+    // Si el usuario ingresó una API Key de Google Gemini (AIza...), usar Gemini Vision directamente
+    if (cleanKey.startsWith('AIza')) {
+      return _analyzeWithGemini(
+        imageBytes: imageBytes,
+        apiKey: cleanKey,
+        mimeType: mimeType,
+      );
+    }
+
+    // Flujo para Groq API (gsk_...)
     final String base64Image = base64Encode(imageBytes);
     final String dataUrl = 'data:$mimeType;base64,$base64Image';
 
+    // 1. Consultar dinámicamente qué modelos están activos en la cuenta de Groq del usuario
+    final List<String> candidateModels =
+        await _discoverGroqVisionModels(cleanKey);
+
+    String lastError = 'No se encontró un modelo de visión disponible.';
+
+    // 2. Probar en orden los modelos candidatos hasta que uno responda con éxito
+    for (final String modelId in candidateModels) {
+      try {
+        final result = await _callGroqModel(
+          modelId: modelId,
+          dataUrl: dataUrl,
+          apiKey: cleanKey,
+          useJsonFormat: true,
+        );
+        return result;
+      } catch (e) {
+        final errStr = e.toString();
+        lastError = errStr.replaceFirst('Exception: ', '');
+
+        // Si el modelo existe pero no soporta response_format json_object con imágenes, reintentar sin response_format
+        if (errStr.contains('response_format') || errStr.contains('json')) {
+          try {
+            return await _callGroqModel(
+              modelId: modelId,
+              dataUrl: dataUrl,
+              apiKey: cleanKey,
+              useJsonFormat: false,
+            );
+          } catch (e2) {
+            lastError = e2.toString().replaceFirst('Exception: ', '');
+          }
+        }
+
+        // Si el error es de API Key inválida, detener inmediatamente
+        if (errStr.contains('invalid_api_key') || errStr.contains('401')) {
+          throw Exception('Tu API Key de Groq no es válida. Revísala en el botón superior.');
+        }
+      }
+    }
+
+    throw Exception(lastError);
+  }
+
+  /// Consulta GET https://api.groq.com/openai/v1/models para descubrir los modelos multimodales activos hoy en la cuenta
+  static Future<List<String>> _discoverGroqVisionModels(String apiKey) async {
+    final List<String> discovered = [];
+    try {
+      final response = await http.get(
+        Uri.parse('https://api.groq.com/openai/v1/models'),
+        headers: {'Authorization': 'Bearer $apiKey'},
+      ).timeout(const Duration(seconds: 8));
+
+      if (response.statusCode == 200) {
+        final Map<String, dynamic> body =
+            jsonDecode(response.body) as Map<String, dynamic>;
+        final List<dynamic> data = (body['data'] as List<dynamic>?) ?? [];
+
+        final List<String> allIds = data
+            .map((m) => (m as Map<String, dynamic>)['id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toList();
+
+        // Priorizar modelos que contengan palabras clave de visión/multimodal en Groq
+        for (final id in allIds) {
+          final lower = id.toLowerCase();
+          if (lower.contains('vision') ||
+              lower.contains('scout') ||
+              lower.contains('maverick') ||
+              lower.contains('llama-4') ||
+              lower.contains('pixtral') ||
+              lower.contains('llava') ||
+              lower.contains('omni') ||
+              lower.contains('vl')) {
+            discovered.add(id);
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Agregar los modelos de respaldo que aún no estén en la lista
+    for (final fallback in _fallbackGroqVisionModels) {
+      if (!discovered.contains(fallback)) {
+        discovered.add(fallback);
+      }
+    }
+    return discovered;
+  }
+
+  static Future<AiPlateAnalysisResult> _callGroqModel({
+    required String modelId,
+    required String dataUrl,
+    required String apiKey,
+    required bool useJsonFormat,
+  }) async {
     final Uri uri =
         Uri.parse('https://api.groq.com/openai/v1/chat/completions');
 
     final Map<String, dynamic> requestBody = {
-      'model': defaultVisionModel,
+      'model': modelId,
       'temperature': 0.2,
       'max_completion_tokens': 1024,
-      'response_format': {'type': 'json_object'},
+      if (useJsonFormat) 'response_format': {'type': 'json_object'},
       'messages': [
         {
           'role': 'user',
@@ -180,7 +291,7 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
         .post(
           uri,
           headers: {
-            'Authorization': 'Bearer $cleanKey',
+            'Authorization': 'Bearer $apiKey',
             'Content-Type': 'application/json',
           },
           body: jsonEncode(requestBody),
@@ -203,7 +314,7 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
         jsonDecode(response.body) as Map<String, dynamic>;
     final List<dynamic>? choices = decodedResponse['choices'] as List<dynamic>?;
     if (choices == null || choices.isEmpty) {
-      throw Exception('Groq no devolvió resultados para la imagen.');
+      throw Exception('El modelo no devolvió resultados para la imagen.');
     }
 
     final String rawContent =
@@ -212,7 +323,56 @@ Responde ÚNICAMENTE con un objeto JSON válido con la siguiente estructura exac
     return parseAiJsonResponse(rawContent);
   }
 
-  /// Parsea el JSON devuelto por el modelo de visión de Groq (incluso si viene envuelto en bloques markdown)
+  /// Soporte alternativo automático por si el usuario ingresa una API Key de Google Gemini (AIza...)
+  static Future<AiPlateAnalysisResult> _analyzeWithGemini({
+    required Uint8List imageBytes,
+    required String apiKey,
+    required String mimeType,
+  }) async {
+    final Uri uri = Uri.parse(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey',
+    );
+
+    final Map<String, dynamic> body = {
+      'contents': [
+        {
+          'parts': [
+            {'text': _systemPrompt},
+            {
+              'inline_data': {
+                'mime_type': mimeType,
+                'data': base64Encode(imageBytes),
+              },
+            },
+          ],
+        },
+      ],
+      'generationConfig': {
+        'temperature': 0.2,
+        'responseMimeType': 'application/json',
+      },
+    };
+
+    final response = await http
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 25));
+
+    if (response.statusCode != 200) {
+      throw Exception('Error en Gemini API (${response.statusCode}): ${response.body}');
+    }
+
+    final Map<String, dynamic> decoded =
+        jsonDecode(response.body) as Map<String, dynamic>;
+    final candidates = decoded['candidates'] as List<dynamic>?;
+    final text = candidates?.first['content']?['parts']?.first['text']?.toString() ?? '';
+    return parseAiJsonResponse(text);
+  }
+
+  /// Parsea el JSON devuelto por el modelo de visión (incluso si viene envuelto en bloques markdown)
   static AiPlateAnalysisResult parseAiJsonResponse(String rawContent) {
     String cleaned = rawContent.trim();
     final int firstBrace = cleaned.indexOf('{');
