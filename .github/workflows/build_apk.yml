@@ -1,0 +1,43 @@
+name: Build Android APK (NutriQR)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Compilar APK de Android
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar codigo del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17 (requerido por Android/Gradle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Configurar Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Instalar dependencias de Flutter
+        run: flutter pub get
+
+      - name: Ejecutar pruebas automatizadas
+        run: flutter test
+
+      - name: Compilar APK de produccion (Release)
+        run: flutter build apk --release
+
+      - name: Subir APK listo para descargar
+        uses: actions/upload-artifact@v4
+        with:
+          name: NutriQR-Android-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
